@@ -1,0 +1,3 @@
+            name: "tс_shard_ai",
+            description: "tс_shard_ai",
+            image: ""

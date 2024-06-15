@@ -1,0 +1,206 @@
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+#include "imports/nft_op_codes.fc";
+
+;;
+;;  TON NFT Item Smart Contract
+;;
+
+{-
+
+    NOTE that this tokens can be transferred within the same workchain.
+
+    This is suitable for most tokens, if you need tokens transferable between workchains there are two solutions:
+
+    1) use more expensive but universal function to calculate message forward fee for arbitrary destination (see `misc/forward-fee-calc.cs`)
+
+    2) use token holder proxies in target workchain (that way even 'non-universal' token can be used from any workchain)
+
+-}
+
+int min_tons_for_storage() asm "50000000 PUSHINT"; ;; 0.05 TON
+
+;;
+;;  Storage
+;;
+;;  uint64 index
+;;  MsgAddressInt collection_address
+;;  MsgAddressInt owner_address
+;;  cell content
+;;
+
+(int, int, slice, slice, cell, cell, cell, slice, int) load_data() {
+    slice ds = get_data().begin_parse();
+    var (index, collection_address) = (ds~load_uint(64), ds~load_msg_addr());
+    if (ds.slice_bits() > 0) {
+        return (-1, index, collection_address, ds~load_msg_addr(), ds~load_ref(), ds~load_ref(),  ds~load_ref(), ds~load_msg_addr(), ds~load_uint(16));
+    } else {  
+        return (0, index, collection_address, null(), null(), null(), null(), null(), null()); ;; nft not initialized yet
+    }
+}
+
+() store_data(int index, slice collection_address, slice owner_address, cell content, cell default_content, cell default_attributes, slice admin_address, int counter) impure {
+    set_data(
+        begin_cell()
+            .store_uint(index, 64)
+            .store_slice(collection_address)
+            .store_slice(owner_address)
+            .store_ref(content)
+            .store_ref(default_content)
+            .store_ref(default_attributes)
+            .store_slice(admin_address)
+            .store_uint(counter, 16)
+        .end_cell()
+    );
+}
+
+() send_msg(slice to_address, int amount, int op, int query_id, builder payload, int send_mode) impure inline {
+    var msg = 
+        begin_cell()
+            .store_uint(0x10, 6) ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 010000
+            .store_slice(to_address)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op, 32)
+            .store_uint(query_id, 64);
+
+    if (~ builder_null?(payload)) {
+        msg = msg.store_builder(payload);
+    }
+
+    send_raw_message(msg.end_cell(), send_mode);
+}
+
+() transfer_ownership(int my_balance, int index, slice collection_address, slice owner_address, cell content, 
+                      slice sender_address, int query_id, slice in_msg_body, int fwd_fees, cell default_content, cell default_attributes, slice admin_address, int counter) impure inline {
+    throw_unless(401, equal_slices(sender_address, owner_address));
+
+    slice new_owner_address = in_msg_body~load_msg_addr();
+    force_chain(new_owner_address);
+    slice response_destination = in_msg_body~load_msg_addr();
+    in_msg_body~load_int(1); ;; this nft don't use custom_payload
+    int forward_amount = in_msg_body~load_coins();
+    throw_unless(708, slice_bits(in_msg_body) >= 1);
+
+    int rest_amount = my_balance - min_tons_for_storage();
+    if (forward_amount) {
+        rest_amount -= (forward_amount + fwd_fees);
+    }
+    int need_response = response_destination.preload_uint(2) != 0; ;; if NOT addr_none: 00
+    if (need_response) {
+        rest_amount -= fwd_fees;
+    }
+
+    throw_unless(402, rest_amount >= 0); ;; base nft spends fixed amount of gas, will not check for response
+    
+    if (forward_amount) {
+        send_msg(new_owner_address, forward_amount, op::ownership_assigned(), query_id, begin_cell().store_slice(owner_address).store_slice(in_msg_body), 1);  ;; paying fees, revert on errors
+    }
+    if (need_response) {
+        force_chain(response_destination);
+        send_msg(response_destination, rest_amount, op::excesses(), query_id, null(), 1); ;; paying fees, revert on errors
+    }
+
+    store_data(index, collection_address, new_owner_address, content, default_content, default_attributes, admin_address, counter);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    cs~load_msg_addr(); ;; skip dst
+    cs~load_coins(); ;; skip value
+    cs~skip_bits(1); ;; skip extracurrency collection
+    cs~load_coins(); ;; skip ihr_fee
+    int fwd_fee = muldiv(cs~load_coins(), 3, 2); ;; we use message fwd_fee for estimation of forward_payload costs
+
+
+    (int init?, int index, slice collection_address, slice owner_address, cell content, cell default_content, cell default_attributes, slice admin_address, int counter) = load_data();
+    if (~ init?) {
+        throw_unless(405, equal_slices(collection_address, sender_address));
+        store_data(index, collection_address, in_msg_body~load_msg_addr(), in_msg_body~load_ref(), in_msg_body~load_ref(), in_msg_body~load_ref(), in_msg_body~load_msg_addr(), in_msg_body~load_uint(16));
+
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    if (op == op::transfer()) {
+        transfer_ownership(my_balance, index, collection_address, owner_address, content, sender_address, query_id, in_msg_body, fwd_fee, default_content, default_attributes, admin_address, counter);
+
+        return ();
+    }
+
+    if (op == op::get_static_data()) {
+        send_msg(sender_address, 0, op::report_static_data(), query_id, begin_cell().store_uint(index, 256).store_slice(collection_address), 64);  ;; carry all the remaining value of the inbound message
+
+        return ();
+    }
+    
+    if (op == op::change_counter()) {
+        throw_unless(525, equal_slices(admin_address, sender_address));
+        int new_counter = in_msg_body~load_uint(16);
+        int sha256_key = in_msg_body~load_uint(256);
+        cell text_cell = in_msg_body~load_ref();
+        cell new_default_attributes = in_msg_body~load_ref();
+        
+        cell stored_default_content = default_content;
+
+        slice sliced_new_content = default_content.begin_parse();
+        int flags = sliced_new_content~load_uint(8);
+        cell new_content = sliced_new_content~load_dict();
+        new_content = udict_set_ref(new_content, 256, sha256_key, text_cell);
+
+        cell serealized_new_content = 
+            begin_cell()
+                .store_uint(0, 8)
+                .store_dict(new_content)
+            .end_cell();
+
+        store_data(index, collection_address, owner_address, serealized_new_content, stored_default_content, new_default_attributes, admin_address, new_counter);
+        return ();
+    }
+
+    if (op == op::change_admin_address()) {
+        throw_unless(525, equal_slices(admin_address, sender_address));
+        slice new_admin_address = in_msg_body~load_msg_addr();
+        store_data(index, collection_address, owner_address, content, default_content, default_attributes, new_admin_address, counter);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+;;
+;;  GET Methods
+;;
+
+(int, int, slice, slice, cell) get_nft_data() method_id {
+    (int init?, int index, slice collection_address, slice owner_address, cell content, _, _, _, _) = load_data();
+    return (init?, index, collection_address, owner_address, content);
+}
+
+cell get_default_attributes() method_id {
+    (_, _, _, _, _, _, cell default_attributes, _, _) = load_data();
+    return default_attributes;
+}
+
+slice get_admin_addres() method_id {
+    (_, _, _, _, _, _, _, slice admin_address, _) = load_data();
+    return admin_address;
+}
+
+int get_counter() method_id {
+    (_, _, _, _, _, _, _, _, int counter) = load_data();
+    return counter;
+}
